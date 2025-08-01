@@ -51,8 +51,12 @@ camera_config_t camera_config;
 // —————————————————————————————————————————————————
 // 5) Identity & topics
 // —————————————————————————————————————————————————
-const char* camera_id = "1"; // เปลี่ยนตามเครื่องใช้งาน
-char topic_json_image[32]; 
+const char* camera_id = "1"; // ⬅️⬅️⬅️ เปลี่ยน ID ของกล้องแค่ตรงนี้ที่เดียว
+char topic_json_image[32];
+char topic_status[32]; 
+
+const char* msg_online   = "online";
+const char* msg_offline  = "offline";
 
 // —————————————————————————————————————————————————
 // 6) Timing
@@ -84,7 +88,9 @@ void setup() {
   delay(1000);
   Serial.println("\n🔌 Starting up...");
 
+  // สร้าง Topic ต่างๆ จาก camera_id
   snprintf(topic_json_image, sizeof(topic_json_image), "camera/%s/image_json", camera_id);
+  snprintf(topic_status, sizeof(topic_status), "camera/%s/status", camera_id);
 
   setup_camera();
   connectWiFi();
@@ -170,9 +176,9 @@ void publishImageAsJson(const uint8_t* data, size_t len) {
     size_t n = serializeJson(doc, json_buffer);
     
     if (mqttClient.publish(topic_json_image, json_buffer, n)) {
-        Serial.printf("   📤 Sent chunk %d/%d (%d bytes JSON)\n", (int)i + 1, (int)numChunks, (int)n);
+        Serial.printf("  📤 Sent chunk %d/%d (%d bytes JSON)\n", (int)i + 1, (int)numChunks, (int)n);
     } else {
-        Serial.printf("   ❌ Failed to send chunk %d\n", (int)i + 1);
+        Serial.printf("  ❌ Failed to send chunk %d\n", (int)i + 1);
     }
     delay(50);
   }
@@ -202,7 +208,7 @@ void setup_camera() {
   camera_config.xclk_freq_hz = 20000000;
   camera_config.pixel_format = PIXFORMAT_JPEG;
   camera_config.frame_size   = FRAMESIZE_HVGA; // 480×320
-  camera_config.jpeg_quality = 10; // lower number = higher quality
+  camera_config.jpeg_quality = 6; // lower number = higher quality
   camera_config.fb_count     = 2; // Using 2 buffers is key to the problem/solution
   
   if (esp_camera_init(&camera_config) != ESP_OK) {
@@ -225,8 +231,14 @@ void connectWiFi() {
 void connectMQTT() {
   Serial.printf("🔗 Connecting to MQTT %s:%u...", mqtt_server, mqtt_port);
   while (!mqttClient.connected()) {
-    if (mqttClient.connect(camera_id, mqtt_user, mqtt_pass)) {
+    // กำหนด Last Will and Testament ก่อนทำการเชื่อมต่อ
+    if (mqttClient.connect(camera_id, mqtt_user, mqtt_pass, topic_status, 1, true, msg_offline)) {
+      
       Serial.println("✅ MQTT connected");
+
+      // เมื่อเชื่อมต่อสำเร็จ ให้ประกาศสถานะ "online"
+      mqttClient.publish(topic_status, msg_online, true); 
+
     } else {
       Serial.printf("❌ rc=%d, retry in 5s\n", mqttClient.state());
       delay(5000);
