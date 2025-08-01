@@ -1,12 +1,11 @@
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include "esp_camera.h"
-#include <ArduinoJson.h> // <--- 1. เพิ่มไลบรารี ArduinoJson
+#include <ArduinoJson.h>
 
 // —————————————————————————————————————————————————
 // Base64 Encoding Function
 // ที่มา: https://github.com/Densaugeo/base64_arduino
-// เราจะใส่ฟังก์ชันนี้เข้ามาในโค้ดเพื่อใช้เข้ารหัส
 // —————————————————————————————————————————————————
 String base64_encode(const uint8_t* data, size_t len);
 
@@ -52,9 +51,12 @@ camera_config_t camera_config;
 // —————————————————————————————————————————————————
 // 5) Identity & topics
 // —————————————————————————————————————————————————
-const char* camera_id = "1"; //เปลี่ยนตามเครื่องใช้งาน
-// <--- 2. เราจะใช้ Topic เดียวสำหรับส่งข้อมูล JSON ทั้งหมด
-char topic_json_image[32]; 
+const char* camera_id = "3"; // ⬅️⬅️⬅️ เปลี่ยน ID ของกล้องแค่ตรงนี้ที่เดียว
+char topic_json_image[32];
+char topic_status[32]; 
+
+const char* msg_online   = "online";
+const char* msg_offline  = "offline";
 
 // —————————————————————————————————————————————————
 // 6) Timing
@@ -81,14 +83,14 @@ void setup() {
   delay(1000);
   Serial.println("\n🔌 Starting up...");
 
-  // <--- 3. เตรียม Topic สำหรับ JSON
+  // สร้าง Topic ต่างๆ จาก camera_id
   snprintf(topic_json_image, sizeof(topic_json_image), "camera/%s/image_json", camera_id);
+  snprintf(topic_status, sizeof(topic_status), "camera/%s/status", camera_id);
 
   setup_camera();
   connectWiFi();
 
   mqttClient.setServer(mqtt_server, mqtt_port);
-  // เพิ่มขนาด Buffer ของ MQTT Client เพื่อรองรับ JSON ที่อาจยาวขึ้น
   mqttClient.setBufferSize(CHUNK_SIZE + 512); 
   connectMQTT();
 }
@@ -112,13 +114,12 @@ void loop() {
       return;
     }
 
-    // <--- 4. เรียกฟังก์ชันใหม่สำหรับส่งเป็น JSON
     publishImageAsJson(fb->buf, fb->len);
     esp_camera_fb_return(fb);
   }
 }
 
-// <--- 5. ฟังก์ชันใหม่สำหรับสร้างและส่ง JSON
+
 void publishImageAsJson(const uint8_t* data, size_t len) {
   size_t numChunks = (len + CHUNK_SIZE - 1) / CHUNK_SIZE;
 
@@ -128,35 +129,29 @@ void publishImageAsJson(const uint8_t* data, size_t len) {
     size_t offset = i * CHUNK_SIZE;
     size_t chunkLen = min(CHUNK_SIZE, len - offset);
 
-    // เข้ารหัสชิ้นส่วนภาพเป็น Base64
     String b64_chunk = base64_encode(data + offset, chunkLen);
 
-    // สร้าง JSON object
-    StaticJsonDocument<1536> doc; // ขนาดต้องใหญ่พอสำหรับ Base64 (1024 * 1.33 ≈ 1365) + metadata
+    StaticJsonDocument<1536> doc; 
     doc["id"] = camera_id;
     doc["index"] = i;
     doc["total"] = numChunks;
     doc["data"] = b64_chunk.c_str();
 
-    // แปลง JSON เป็น String เพื่อส่ง
     char json_buffer[1536];
     size_t n = serializeJson(doc, json_buffer);
     
-    // ส่งข้อมูล JSON ผ่าน MQTT
     if (mqttClient.publish(topic_json_image, json_buffer, n)) {
         Serial.printf("  📤 Sent chunk %d/%d (%d bytes JSON)\n", (int)i + 1, (int)numChunks, (int)n);
     } else {
         Serial.printf("  ❌ Failed to send chunk %d\n", (int)i + 1);
     }
 
-    delay(50); // หน่วงเวลาเล็กน้อยให้ Broker จัดการข้อความ
+    delay(50); 
   }
 
   Serial.printf("✅ Finished sending image from camera %s.\n", camera_id);
 }
 
-
-// --- ส่วนของฟังก์ชันอื่นๆ (เหมือนเดิม) ---
 void setup_camera() {
   Serial.println("🔌 Initializing camera...");
   camera_config.ledc_channel = LEDC_CHANNEL_0;
@@ -177,10 +172,10 @@ void setup_camera() {
   camera_config.pin_sccb_scl = SIOC_GPIO_NUM;
   camera_config.pin_pwdn     = PWDN_GPIO_NUM;
   camera_config.pin_reset    = RESET_GPIO_NUM;
-  camera_config.xclk_freq_hz = 22000000;
+  camera_config.xclk_freq_hz = 20000000;
   camera_config.pixel_format = PIXFORMAT_JPEG;
   camera_config.frame_size   = FRAMESIZE_HVGA; // 480×320
-  camera_config.jpeg_quality = 6;            // lower number = higher quality
+  camera_config.jpeg_quality = 6;             // lower number = higher quality
   camera_config.fb_count     = 2;
   if (esp_camera_init(&camera_config) != ESP_OK) {
     Serial.println("❌ Camera init failed! Halting.");
@@ -202,8 +197,14 @@ void connectWiFi() {
 void connectMQTT() {
   Serial.printf("🔗 Connecting to MQTT %s:%u...", mqtt_server, mqtt_port);
   while (!mqttClient.connected()) {
-    if (mqttClient.connect(camera_id, mqtt_user, mqtt_pass)) {
+    // กำหนด Last Will and Testament ก่อนทำการเชื่อมต่อ
+    if (mqttClient.connect(camera_id, mqtt_user, mqtt_pass, topic_status, 1, true, msg_offline)) {
+      
       Serial.println("✅ MQTT connected");
+
+      // เมื่อเชื่อมต่อสำเร็จ ให้ประกาศสถานะ "online"
+      mqttClient.publish(topic_status, msg_online, true); 
+
     } else {
       Serial.printf("❌ rc=%d, retry in 5s\n", mqttClient.state());
       delay(5000);
@@ -215,8 +216,8 @@ void connectMQTT() {
 // Base64 Encoding Implementation
 // —————————————————————————————————————————————————
 const char b64_alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-                            "abcdefghijklmnopqrstuvwxyz"
-                            "0123456789+/";
+                              "abcdefghijklmnopqrstuvwxyz"
+                              "0123456789+/";
 
 String base64_encode(const uint8_t* data, size_t len) {
   String encoded;
