@@ -1,4 +1,5 @@
 #include <WiFi.h>
+#include <WebServer.h>      // ++ ADDED ++ Library สำหรับสร้าง Web Server
 #include <PubSubClient.h>
 #include "esp_camera.h"
 #include <ArduinoJson.h>
@@ -71,12 +72,16 @@ const size_t CHUNK_SIZE = 1024; // 1 KB per MQTT message
 
 WiFiClient   wifiClient;
 PubSubClient mqttClient(wifiClient);
+WebServer server(80); // ++ ADDED ++ สร้าง Object ของ Web Server ที่ Port 80
 
 // Forward declarations
 void setup_camera();
 void connectWiFi();
 void connectMQTT();
 void publishImageAsJson(const uint8_t* data, size_t len);
+void handleRoot();      // ++ ADDED ++
+void handleStream();    // ++ ADDED ++
+
 
 void setup() {
   Serial.begin(115200);
@@ -95,12 +100,21 @@ void setup() {
   setup_camera();
   connectWiFi();
 
+  // ++ ADDED ++  ตั้งค่าและเริ่ม Web Server สำหรับ Live View
+  Serial.println("🚀 Starting Web Server for Live View...");
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/stream", HTTP_GET, handleStream);
+  server.begin();
+  Serial.printf("✅ Web Server started. Open http://%s for live view.\n", WiFi.localIP().toString().c_str());
+
   mqttClient.setServer(mqtt_server, mqtt_port);
   mqttClient.setBufferSize(CHUNK_SIZE + 512); 
   connectMQTT();
 }
 
 void loop() {
+  server.handleClient(); // ++ ADDED ++ ให้ Web Server จัดการ Request ที่เข้ามา (สำคัญมาก!)
+
   if (!mqttClient.connected()) {
     connectMQTT();
   }
@@ -111,7 +125,7 @@ void loop() {
     lastCapture = now;
 
     // 1. เปิดแฟลช
-    Serial.println("💡 Turning flash ON...");
+    Serial.println("💡 Turning flash ON for MQTT capture...");
     digitalWrite(FLASH_GPIO_NUM, HIGH);
     
     // เพิ่ม Delay ให้นานขึ้นเป็น 1 วินาทีเต็ม เพื่อให้ระบบไฟเสถียร
@@ -155,10 +169,49 @@ void loop() {
   }
 }
 
+// ++ ADDED ++ ฟังก์ชันสำหรับจัดการหน้าแรกของ Web Server
+void handleRoot() {
+  String html = "<html><head><title>ESP32-CAM Live View</title></head>";
+  html += "<body style='font-family: Arial, sans-serif; text-align: center; background-color: #222; color: #EEE;'>";
+  html += "<h1>ESP32-CAM Live View</h1>";
+  html += "<h3>Camera ID: " + String(camera_id) + " (Flash is OFF during live view)</h3>";
+  // รูปภาพจะดึงมาจาก URL /stream ซึ่งจะเรียกฟังก์ชัน handleStream
+  html += "<img src='/stream' style='max-width: 95%; border: 2px solid #555;'>";
+  html += "</body></html>";
+  server.send(200, "text/html", html);
+}
+
+// ++ ADDED ++ ฟังก์ชันสำหรับจัดการการสตรีมวิดีโอ (MJPEG)
+void handleStream() {
+  WiFiClient client = server.client();
+  String response = "HTTP/1.1 200 OK\r\n";
+  response += "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n";
+  server.sendContent(response);
+
+  // ในโหมด Live View เราจะไม่ใช้แฟลช
+  while (client.connected()) {
+    camera_fb_t* fb = esp_camera_fb_get();
+    if (!fb) {
+      Serial.println("❌ Stream: Camera capture failed");
+      continue;
+    }
+
+    client.print("--frame\r\n");
+    client.print("Content-Type: image/jpeg\r\n");
+    client.print("Content-Length: " + String(fb->len) + "\r\n\r\n");
+    client.write(fb->buf, fb->len);
+    client.print("\r\n");
+    
+    esp_camera_fb_return(fb);
+  }
+  Serial.println("-> Client disconnected from stream. Resuming normal MQTT operation.");
+}
+
+
 void publishImageAsJson(const uint8_t* data, size_t len) {
   size_t numChunks = (len + CHUNK_SIZE - 1) / CHUNK_SIZE;
 
-  Serial.printf("📸 Preparing to send %u-byte image in %u JSON chunks...\n", (unsigned)len, (unsigned)numChunks);
+  Serial.printf("📸 Preparing to send %u-byte image in %u JSON chunks via MQTT...\n", (unsigned)len, (unsigned)numChunks);
 
   for (size_t i = 0; i < numChunks; i++) {
     size_t offset = i * CHUNK_SIZE;
@@ -176,9 +229,9 @@ void publishImageAsJson(const uint8_t* data, size_t len) {
     size_t n = serializeJson(doc, json_buffer);
     
     if (mqttClient.publish(topic_json_image, json_buffer, n)) {
-        Serial.printf("  📤 Sent chunk %d/%d (%d bytes JSON)\n", (int)i + 1, (int)numChunks, (int)n);
+        Serial.printf("   📤 Sent chunk %d/%d (%d bytes JSON)\n", (int)i + 1, (int)numChunks, (int)n);
     } else {
-        Serial.printf("  ❌ Failed to send chunk %d\n", (int)i + 1);
+        Serial.printf("   ❌ Failed to send chunk %d\n", (int)i + 1);
     }
     delay(50);
   }
@@ -207,9 +260,13 @@ void setup_camera() {
   camera_config.pin_reset    = RESET_GPIO_NUM;
   camera_config.xclk_freq_hz = 20000000;
   camera_config.pixel_format = PIXFORMAT_JPEG;
+  
+  // ++ RECOMMENDATION ++ ปรับคุณภาพของภาพให้เหมาะกับการสตรีมและส่ง MQTT
+  // การใช้คุณภาพสูง (เลขน้อย) อาจทำให้ภาพใหญ่และสตรีมไม่ลื่นไหล
+  // ลองปรับเป็น 10-12 เพื่อให้ขนาดภาพเล็กลง
   camera_config.frame_size   = FRAMESIZE_HVGA; // 480×320
-  camera_config.jpeg_quality = 6; // lower number = higher quality
-  camera_config.fb_count     = 2; // Using 2 buffers is key to the problem/solution
+  camera_config.jpeg_quality = 12; // 10-12 is good for streaming (higher value = lower quality, smaller size)
+  camera_config.fb_count     = 2; // Using 2 buffers is key
   
   if (esp_camera_init(&camera_config) != ESP_OK) {
     Serial.println("❌ Camera init failed! Halting.");
