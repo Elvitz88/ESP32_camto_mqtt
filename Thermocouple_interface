@@ -1,0 +1,243 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <Adafruit_MAX31855.h>
+#include <ESP8266WiFi.h>      // สำหรับบอร์ด ESP8266
+#include <PubSubClient.h>     // สำหรับ MQTT
+#include <ArduinoJson.h>      // สำหรับสร้างข้อมูล JSON
+
+// =================================================================
+// 1) ⚙️ Configuration (แก้ไขค่าในส่วนนี้)
+// =================================================================
+// —————————————————————————————————————————————————
+// 2) Your Wi‑Fi credentials
+// —————————————————————————————————————————————————
+const char* ssid     = "TP-Link_61E3_2.4";
+const char* password = "0800453956";
+
+// —————————————————————————————————————————————————
+// 3) MQTT Broker settings
+// —————————————————————————————————————————————————
+const char* mqtt_server  = "192.168.1.106";
+const uint16_t mqtt_port = 1883;
+const char* mqtt_user    = "admin";
+const char* mqtt_pass    = "admin1234";         // <-- ใส่ Password MQTT (ถ้ามี)
+
+// --- Device Identity ---
+const char* thermo_id = "1";     // <-- ตั้ง ID เฉพาะสำหรับอุปกรณ์นี้ (เป็นตัวเลขในรูปแบบ String)
+
+// =================================================================
+// 2) Pin Mapping & Hardware Setup (NodeMCU ESP8266)
+// =================================================================
+// --- Thermocouple MAX31855 ---
+#define PIN_DO   D6   // GPIO12 - MISO
+#define PIN_CS   D7   // GPIO13 - CS
+#define PIN_CLK  D5   // GPIO14 - SCK
+Adafruit_MAX31855 thermocouple(PIN_CLK, PIN_CS, PIN_DO);
+
+// --- LCD I2C 1602 ---
+#define LCD_ADDR 0x27 // ถ้าจอไม่ขึ้น ลองเปลี่ยนเป็น 0x3F
+LiquidCrystal_I2C lcd(LCD_ADDR, 16, 2);
+
+// =================================================================
+// 3) Global Objects & Variables
+// =================================================================
+// --- MQTT ---
+char topic_temperature[40];
+char topic_status[40];
+const char* msg_online  = "online";
+const char* msg_offline = "offline";
+WiFiClient   wifiClient;
+PubSubClient mqttClient(wifiClient);
+
+// --- Timing ---
+unsigned long last_publish = 0;
+const unsigned long publish_interval = 5000; // ส่งข้อมูลทุก 5 วินาที (5000 ms)
+
+// =================================================================
+// Function Prototypes
+// =================================================================
+void connectWiFi();
+void connectMQTT();
+void publishTemperatureData(double tempC);
+
+
+// =================================================================
+// SETUP: ทำงานครั้งเดียวเมื่อเปิดเครื่อง
+// =================================================================
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+  Serial.println("\n[INFO] Booting up ESP8266 MAX31855 MQTT Probe...");
+
+  // สร้างชื่อ Topic จาก thermo_id
+  snprintf(topic_temperature, sizeof(topic_temperature), "sensor/%s/temperature", thermo_id);
+  snprintf(topic_status, sizeof(topic_status), "sensor/%s/status", thermo_id);
+  Serial.printf("[INFO] Temperature Topic: %s\n", topic_temperature);
+  Serial.printf("[INFO] Status Topic:      %s\n", topic_status);
+
+  // เริ่ม I2C ด้วยขา SDA=D2, SCL=D1 (ค่าเริ่มต้นของ NodeMCU)
+  Wire.begin(D2, D1);
+
+  // เริ่มจอ LCD
+  lcd.init();
+  lcd.backlight();
+  lcd.clear();
+  lcd.setCursor(0,0);
+  lcd.print("Sensor Starting");
+
+  // เริ่ม MAX31855
+  if (!thermocouple.begin()) {
+    Serial.println("[ERROR] MAX31855 not found!");
+    lcd.setCursor(0,1);
+    lcd.print("No MAX31855!");
+  }
+
+  // เชื่อมต่อ Wi-Fi และ MQTT
+  connectWiFi();
+  mqttClient.setServer(mqtt_server, mqtt_port);
+  connectMQTT(); // ทำการเชื่อมต่อครั้งแรก
+}
+
+
+// =================================================================
+// LOOP: ทำงานวนซ้ำไปเรื่อยๆ
+// =================================================================
+void loop() {
+  // ตรวจสอบการเชื่อมต่อ MQTT และเชื่อมต่อใหม่ถ้าหลุด
+  if (!mqttClient.connected()) {
+    connectMQTT();
+  }
+  // Loop นี้สำคัญมากสำหรับ PubSubClient เพื่อให้รับ-ส่งข้อมูลเบื้องหลังได้
+  mqttClient.loop();
+
+  // ใช้ millis() ในการจับเวลาส่งข้อมูลแบบไม่หน่วงการทำงาน (non-blocking)
+  unsigned long now = millis();
+  if (now - last_publish >= publish_interval) {
+    last_publish = now; // อัปเดตเวลาที่ส่งล่าสุด
+
+    double c = thermocouple.readCelsius();
+
+    // --- ส่วนแสดงผลบนจอ LCD ---
+    lcd.setCursor(0,0);
+    if (isnan(c)) {
+      lcd.print("Read error      ");
+      lcd.setCursor(0,1);
+      lcd.print("Check wiring    ");
+      Serial.println("[ERROR] Failed to read from thermocouple!");
+
+      // ส่งสถานะ error ไปยัง MQTT
+      publishTemperatureData(NAN);
+
+    } else {
+      double f = c * 9.0 / 5.0 + 32.0;
+
+      // บรรทัดบน: แสดงองศา C
+      lcd.print("Temp: ");
+      lcd.print(c, 2);
+      lcd.print((char)223); // สัญลักษณ์องศา °
+      lcd.print("C   ");
+
+      // บรรทัดล่าง: แสดงองศา F
+      lcd.setCursor(0,1);
+      lcd.print("F: ");
+      lcd.print(f, 2);
+      lcd.print((char)223);
+      lcd.print("F      ");
+
+      // แสดงผลบน Serial Monitor
+      Serial.printf("[DATA] C=%.2f, F=%.2f\n", c, f);
+
+      // --- ส่วนส่งข้อมูล MQTT ---
+      publishTemperatureData(c);
+    }
+  }
+}
+
+/**
+ * @brief สร้าง JSON payload และ publish ไปยัง MQTT Broker
+ * @param tempC อุณหภูมิในหน่วยเซลเซียส. ถ้าอ่านค่าไม่ได้ให้ส่ง NAN
+ */
+void publishTemperatureData(double tempC) {
+  StaticJsonDocument<200> doc;
+
+  if (isnan(tempC)) {
+    doc["status"] = "error";
+    doc["error_message"] = "Failed to read sensor";
+  } else {
+    doc["device_id"] = thermo_id;
+    doc["temperature_celsius"] = serialized(String(tempC, 2)); // ส่งเป็นทศนิยม 2 ตำแหน่ง
+    doc["unit"] = "C";
+    doc["status"] = "ok";
+  }
+
+  char json_buffer[200];
+  size_t n = serializeJson(doc, json_buffer);
+
+  Serial.printf("[MQTT] Publishing to %s: %s\n", topic_temperature, json_buffer);
+
+  // Publish ข้อมูล พร้อมแปลงชนิดข้อมูล (Type Cast) ตรงนี้
+  if (!mqttClient.publish(topic_temperature, (const uint8_t*)json_buffer, n, true)) {
+     Serial.println("[MQTT] Failed to publish temperature data.");
+  }
+}
+
+/**
+ * @brief เชื่อมต่อ Wi-Fi และแสดงสถานะบนจอ LCD
+ */
+void connectWiFi() {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Connecting WiFi");
+  Serial.printf("📶 Connecting to WiFi %s...", ssid);
+
+  WiFi.begin(ssid, password);
+  int dot_count = 0;
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+    lcd.setCursor(dot_count, 1);
+    lcd.print(".");
+    dot_count++;
+    if (dot_count > 15) { // วนจุดบนจอถ้าเชื่อมต่อนาน
+        lcd.setCursor(0,1);
+        lcd.print("                ");
+        dot_count = 0;
+    }
+  }
+  Serial.printf("\n✅ WiFi connected, IP: %s\n", WiFi.localIP().toString().c_str());
+  lcd.clear();
+  lcd.print("WiFi Connected!");
+  lcd.setCursor(0,1);
+  lcd.print(WiFi.localIP());
+  delay(2000);
+  lcd.clear();
+}
+
+/**
+ * @brief เชื่อมต่อ MQTT Broker พร้อมตั้งค่า Last Will and Testament (LWT)
+ */
+void connectMQTT() {
+  Serial.printf("🔗 Connecting to MQTT %s:%u...", mqtt_server, mqtt_port);
+  while (!mqttClient.connected()) {
+    lcd.clear();
+    lcd.setCursor(0,0);
+    lcd.print("Connecting MQTT");
+    // กำหนด LWT: ถ้าหลุดการเชื่อมต่อ Broker จะส่ง "offline" ไปที่ topic_status
+    if (mqttClient.connect(thermo_id, mqtt_user, mqtt_pass, topic_status, 1, true, msg_offline)) {
+      Serial.println("\n✅ MQTT connected");
+      lcd.setCursor(0,1);
+      lcd.print("Connected!");
+      delay(1000);
+
+      // เมื่อเชื่อมต่อสำเร็จ ให้ประกาศสถานะ "online"
+      mqttClient.publish(topic_status, msg_online, true); // retain = true
+    } else {
+      Serial.printf("\n❌ MQTT connection failed, rc=%d. Retrying in 5 seconds...\n", mqttClient.state());
+      lcd.setCursor(0,1);
+      lcd.print("Failed! Retry...");
+      delay(5000);
+    }
+  }
+  lcd.clear();
+}
